@@ -187,10 +187,21 @@ func (pk *packet) read(b []byte) (int, error) {
 		pk.splitCount = binary.BigEndian.Uint32(b[offset:])
 		pk.splitID = binary.BigEndian.Uint16(b[offset+4:])
 		pk.splitIndex = binary.BigEndian.Uint32(b[offset+6:])
+		if pk.splitCount == 0 {
+			return 0, errors.New("invalid split packet: split count cannot be 0")
+		}
+		if pk.splitIndex >= pk.splitCount {
+			return 0, errors.New("invalid split packet: split index out of range")
+		}
 		offset += 10
 	}
 
-	pk.content = make([]byte, n)
+	// pk.content is reused across reads. Callers that retain it past the next
+	// pk.read call must clone it before storing.
+	if cap(pk.content) < int(n) {
+		pk.content = make([]byte, n)
+	}
+	pk.content = pk.content[:n]
 	if got := copy(pk.content, b[offset:]); got != int(n) {
 		return 0, io.ErrUnexpectedEOF
 	}

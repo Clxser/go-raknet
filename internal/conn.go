@@ -1,8 +1,11 @@
 package internal
 
 import (
+	"errors"
 	"net"
 )
+
+var errNotImplemented = errors.New("not implemented")
 
 // ConnToPacketConn wraps around a dialed UDP connection. Its only purpose
 // is to wrap around WriteTo and make it call Write instead, because WriteTo
@@ -23,4 +26,6 @@ func (conn *wrappedConn) WriteTo(b []byte, _ net.Addr) (n int, err error) {
 	return conn.Conn.Write(b)
 }
 
-func (conn *wrappedConn) ReadFrom([]byte) (int, net.Addr, error) { panic("unused") }
+func (conn *wrappedConn) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, errNotImplemented
+}

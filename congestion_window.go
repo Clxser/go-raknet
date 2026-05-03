@@ -20,6 +20,9 @@ type congestionWindow struct {
 	estimatedRTT time.Duration
 	deviationRTT time.Duration
 
+	// nextCongestionControlBlock is the first sequence number after the current
+	// congestion-control block. At most one NACK/timeout backoff is applied per
+	// block, and ACKs that advance beyond it open the next block.
 	nextCongestionControlBlock uint24
 	backoffThisBlock           bool
 }
@@ -41,19 +44,18 @@ func (w *congestionWindow) transmissionBandwidth(inFlightBytes int) int {
 	return 0
 }
 
-func (w *congestionWindow) onAck(rtt time.Duration, sequenceNumber, nextSequenceNumber uint24) {
-	if rtt <= 0 {
-		return
-	}
-	w.lastRTT = rtt
-	if w.estimatedRTT == unsetRTT {
-		w.estimatedRTT = rtt
-		w.deviationRTT = rtt
-	} else {
-		const d = 0.05
-		difference := float64(rtt - w.estimatedRTT)
-		w.estimatedRTT += time.Duration(d * difference)
-		w.deviationRTT += time.Duration(d * (math.Abs(difference) - float64(w.deviationRTT)))
+func (w *congestionWindow) onAck(rtt time.Duration, sequenceNumber, nextSequenceNumber uint24, updateRTT bool) {
+	if updateRTT && rtt > 0 {
+		w.lastRTT = rtt
+		if w.estimatedRTT == unsetRTT {
+			w.estimatedRTT = rtt
+			w.deviationRTT = rtt
+		} else {
+			const d = 0.05
+			difference := float64(rtt - w.estimatedRTT)
+			w.estimatedRTT += time.Duration(d * difference)
+			w.deviationRTT += time.Duration(d * (math.Abs(difference) - float64(w.deviationRTT)))
+		}
 	}
 
 	newBlock := sequenceGreaterThan(sequenceNumber, w.nextCongestionControlBlock)
@@ -74,12 +76,18 @@ func (w *congestionWindow) onAck(rtt time.Duration, sequenceNumber, nextSequence
 }
 
 func (w *congestionWindow) onNAK() {
+	// NACKs indicate packet loss but not necessarily a timeout. They gently
+	// lower the slow-start threshold; timeout resends use onResend below and
+	// collapse cwnd more aggressively.
 	if !w.backoffThisBlock {
 		w.ssThresh = w.cwnd * 0.75
 	}
 }
 
 func (w *congestionWindow) onResend(nextSequenceNumber uint24) {
+	// Timeout-driven resends are treated as stronger congestion signals than
+	// NACKs: cwnd collapses to one MTU and the current congestion-control block
+	// is backed off only once.
 	mtu := float64(w.mtu)
 	if w.backoffThisBlock || w.cwnd <= mtu*2 {
 		return
@@ -113,6 +121,5 @@ func (w *congestionWindow) inSlowStart() bool {
 }
 
 func sequenceGreaterThan(a, b uint24) bool {
-	const halfSpan = uint24(0xFFFFFF) / 2
-	return b != a && b-a > halfSpan
+	return uint24Less(b, a)
 }

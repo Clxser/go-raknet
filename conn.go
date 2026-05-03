@@ -23,9 +23,14 @@ const (
 	// specific.
 	protocolVersion byte = 11
 
-	minMTUSize    = 400
-	maxMTUSize    = 1492
-	maxWindowSize = 2048
+	minMTUSize                 = 400
+	maxMTUSize                 = 1492
+	recvBufferSize             = maxMTUSize + 28
+	defaultMaxReceiveWindow    = 2048
+	defaultMaxPendingPackets   = 4096
+	defaultMaxSplitCount       = 512
+	defaultMaxConcurrentSplits = 16
+	maxConfigurableWindowSize  = uint24Half - 1
 )
 
 // Conn represents a connection to a specific client. It is not a real
@@ -107,7 +112,7 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		handler:        h,
 		pk:             new(packet),
 		connected:      make(chan struct{}),
-		packets:        internal.Chan[[]byte](4, 4096),
+		packets:        internal.Chan[[]byte](4, h.maxPendingPackets()),
 		splits:         make(map[uint16][][]byte),
 		win:            newDatagramWindow(),
 		packetQueue:    newPacketQueue(),
@@ -190,10 +195,8 @@ func (conn *Conn) flushACKs() {
 	if len(conn.ackSlice) > 0 {
 		// Write an ACK packet to the connection containing all datagram
 		// sequence numbers that we received since the last tick.
-		if err := conn.sendACK(conn.ackSlice...); err != nil {
-			return
-		}
-		conn.ackSlice = conn.ackSlice[:0]
+		defer func() { conn.ackSlice = conn.ackSlice[:0] }()
+		_ = conn.sendACK(conn.ackSlice...)
 	}
 }
 
@@ -221,6 +224,7 @@ func (conn *Conn) checkResend(now time.Time) {
 	if len(resend) > 0 {
 		conn.congestion.onResend(conn.seq)
 	}
+	slices.Sort(resend)
 	_ = conn.resend(resend)
 }
 
@@ -342,8 +346,8 @@ func (conn *Conn) Context() context.Context {
 func (conn *Conn) closeImmediately() {
 	conn.once.Do(func() {
 		_, _ = conn.Write([]byte{message.IDDisconnectNotification})
-		conn.handler.close(conn)
 		conn.cancelFunc()
+		conn.handler.close(conn)
 
 		conn.mu.Lock()
 		defer conn.mu.Unlock()
@@ -387,6 +391,15 @@ func (conn *Conn) SetDeadline(time.Time) error { return ErrNotSupported }
 // and is half the average round trip time (RTT).
 func (conn *Conn) Latency() time.Duration {
 	return time.Duration(conn.rtt.Load() / 2)
+}
+
+// Pending returns the number of reliable datagrams either queued for the
+// congestion controller or awaiting acknowledgement. Applications may use this
+// as a backpressure signal during bursts.
+func (conn *Conn) Pending() int {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return len(conn.retransmission.unacknowledged) + len(conn.sendQueue)
 }
 
 // send encodes an encoding.BinaryMarshaler and writes it to the Conn.
@@ -455,8 +468,8 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 			}
 		}
 	}
-	if conn.win.size() > maxWindowSize && conn.handler.limitsEnabled() {
-		return fmt.Errorf("receive datagram: queue window size is too big (%v-%v)", conn.win.lowest, conn.win.highest)
+	if maxWindow := conn.handler.maxReceiveWindow(); conn.win.size() > maxWindow && conn.handler.limitsEnabled() {
+		return fmt.Errorf("receive datagram: queue window size is too big (%v-%v, max %v)", conn.win.lowest, conn.win.highest, maxWindow)
 	}
 	return conn.handleDatagram(b[3:])
 }
@@ -489,12 +502,12 @@ func (conn *Conn) receivePacket(packet *packet) error {
 		// If it isn't a reliable ordered packet, handle it immediately.
 		return conn.handlePacket(packet.content)
 	}
-	if !conn.packetQueue.put(packet.orderIndex, packet.content) {
+	if !conn.packetQueue.put(packet.orderIndex, slices.Clone(packet.content)) {
 		// An ordered packet arrived twice.
 		return nil
 	}
-	if conn.packetQueue.WindowSize() > maxWindowSize && conn.handler.limitsEnabled() {
-		return fmt.Errorf("packet queue window size is too big (%v-%v)", conn.packetQueue.lowest, conn.packetQueue.highest)
+	if maxWindow := conn.handler.maxReceiveWindow(); conn.packetQueue.WindowSize() > maxWindow && conn.handler.limitsEnabled() {
+		return fmt.Errorf("packet queue window size is too big (%v-%v, max %v)", conn.packetQueue.lowest, conn.packetQueue.highest, maxWindow)
 	}
 	for _, content := range conn.packetQueue.fetch() {
 		if err := conn.handlePacket(content); err != nil {
@@ -522,9 +535,26 @@ func (conn *Conn) handlePacket(b []byte) error {
 		return fmt.Errorf("handle packet: %w", err)
 	}
 	if !handled {
-		conn.packets.Send(b)
+		conn.packets.Send(slices.Clone(b))
 	}
 	return nil
+}
+
+type addrStringKey struct {
+	network string
+	address string
+}
+
+type addrNilKey struct{}
+
+func addrKey(addr net.Addr) any {
+	if _, ok := addr.(*net.UDPAddr); ok {
+		return resolve(addr)
+	}
+	if addr == nil {
+		return addrNilKey{}
+	}
+	return addrStringKey{network: addr.Network(), address: addr.String()}
 }
 
 func resolve(addr net.Addr) netip.AddrPort {
@@ -543,26 +573,29 @@ func resolve(addr net.Addr) netip.AddrPort {
 // packet of its sequence, it will continue handling the full packet as it
 // otherwise would. An error is returned if the packet was not valid.
 func (conn *Conn) receiveSplitPacket(p *packet) error {
-	const maxSplitCount = 512
-	const maxConcurrentSplits = 16
-
-	if p.splitCount > maxSplitCount && conn.handler.limitsEnabled() {
-		return fmt.Errorf("split packet: split count %v exceeds the maximum %v", p.splitCount, maxSplitCount)
+	if p.splitCount == 0 {
+		return fmt.Errorf("split packet: split count cannot be 0")
 	}
-	if len(conn.splits) > maxConcurrentSplits && conn.handler.limitsEnabled() {
-		return fmt.Errorf("split packet: maximum concurrent splits %v reached", maxConcurrentSplits)
+	if maxSplitCount := conn.handler.maxSplitCount(); p.splitCount > maxSplitCount && conn.handler.limitsEnabled() {
+		return fmt.Errorf("split packet: split count %v exceeds the maximum %v", p.splitCount, maxSplitCount)
 	}
 	m, ok := conn.splits[p.splitID]
 	if !ok {
+		maxConcurrentSplits := conn.handler.maxConcurrentSplits()
+		if len(conn.splits) >= maxConcurrentSplits && conn.handler.limitsEnabled() {
+			return fmt.Errorf("split packet: maximum concurrent splits %v reached", maxConcurrentSplits)
+		}
 		m = make([][]byte, p.splitCount)
 		conn.splits[p.splitID] = m
+	} else if uint32(len(m)) != p.splitCount {
+		return fmt.Errorf("split packet: split count changed for split ID %v (%v != %v)", p.splitID, p.splitCount, len(m))
 	}
-	if p.splitIndex > uint32(len(m)-1) {
+	if p.splitIndex >= uint32(len(m)) {
 		// The split index was either negative or was bigger than the slice
 		// size, meaning the packet is invalid.
 		return fmt.Errorf("split packet: split index %v is out of range (0 - %v)", p.splitIndex, len(m)-1)
 	}
-	m[p.splitIndex] = p.content
+	m[p.splitIndex] = slices.Clone(p.content)
 
 	if slices.ContainsFunc(m, func(i []byte) bool { return len(i) == 0 }) {
 		// We haven't yet received all split fragments, so we cannot add the
@@ -620,18 +653,19 @@ func (conn *Conn) handleACK(b []byte) error {
 	if err := ack.read(b); err != nil {
 		return fmt.Errorf("read ACK: %w", err)
 	}
+	now := time.Now()
 	for _, sequenceNumber := range ack.packets {
 		// Take out all stored packets from the recovery queue.
 		if record, ok := conn.retransmission.acknowledge(sequenceNumber); ok {
-			rtt := time.Since(record.timestamp)
-			conn.congestion.onAck(rtt, sequenceNumber, conn.seq)
-			conn.rtt.Store(int64(conn.retransmission.rtt(time.Now())))
+			rtt := now.Sub(record.timestamp)
+			conn.congestion.onAck(rtt, sequenceNumber, conn.seq, !record.retransmitted)
 			// Clear the packet and return it to the pool so that it may be
 			// re-used.
 			record.pk.content = record.pk.content[:0]
 			packetPool.Put(record.pk)
 		}
 	}
+	conn.rtt.Store(int64(conn.retransmission.rtt(now)))
 	_ = conn.flushSendQueueLocked()
 	return nil
 }
@@ -649,7 +683,6 @@ func (conn *Conn) handleNACK(b []byte) error {
 	for _, sequenceNumber := range nack.packets {
 		if _, ok := conn.retransmission.unacknowledged[sequenceNumber]; ok {
 			conn.congestion.onNAK()
-			break
 		}
 	}
 	return conn.resend(nack.packets)
@@ -663,7 +696,7 @@ func (conn *Conn) resend(sequenceNumbers []uint24) (err error) {
 		if !ok {
 			continue
 		}
-		if err = conn.sendDatagram(pk); err != nil {
+		if err = conn.sendDatagram(pk, true); err != nil {
 			return err
 		}
 	}
@@ -672,10 +705,10 @@ func (conn *Conn) resend(sequenceNumbers []uint24) (err error) {
 
 func (conn *Conn) queueDatagram(pk *packet) error {
 	if !pk.reliability.reliable() {
-		return conn.sendDatagram(pk)
+		return conn.sendDatagram(pk, false)
 	}
 	if len(conn.sendQueue) == 0 && conn.canSendDatagram(pk) {
-		return conn.sendDatagram(pk)
+		return conn.sendDatagram(pk, false)
 	}
 	conn.sendQueue = append(conn.sendQueue, pk)
 	return conn.flushSendQueueLocked()
@@ -694,10 +727,12 @@ func (conn *Conn) flushSendQueueLocked() error {
 		if !conn.canSendDatagram(pk) {
 			return nil
 		}
-		copy(conn.sendQueue, conn.sendQueue[1:])
-		conn.sendQueue[len(conn.sendQueue)-1] = nil
-		conn.sendQueue = conn.sendQueue[:len(conn.sendQueue)-1]
-		if err := conn.sendDatagram(pk); err != nil {
+		// Pop before sending so bitFlagContinuousSend reflects whether more
+		// queued datagrams remain. Re-prepend on the rare write error path to
+		// preserve original send order.
+		conn.sendQueue[0] = nil
+		conn.sendQueue = conn.sendQueue[1:]
+		if err := conn.sendDatagram(pk, false); err != nil {
 			conn.sendQueue = append([]*packet{pk}, conn.sendQueue...)
 			return err
 		}
@@ -711,7 +746,7 @@ func (conn *Conn) canSendDatagram(pk *packet) bool {
 
 // sendDatagram sends a datagram over the connection that includes the packet
 // passed. It is assigned a new sequence number and added to the retransmission.
-func (conn *Conn) sendDatagram(pk *packet) error {
+func (conn *Conn) sendDatagram(pk *packet, retransmitted bool) error {
 	flags := byte(bitFlagDatagram | bitFlagNeedsBAndAS)
 	if len(conn.sendQueue) > 0 {
 		flags |= bitFlagContinuousSend
@@ -726,7 +761,7 @@ func (conn *Conn) sendDatagram(pk *packet) error {
 	if pk.reliability.reliable() {
 		// We then re-add the pk to the recovery queue in case the new one gets
 		// lost too, in which case we need to resend it again.
-		conn.retransmission.add(seq, pk, length)
+		conn.retransmission.add(seq, pk, length, retransmitted)
 	}
 
 	if err := conn.writeTo(conn.buf.Bytes(), conn.raddr); err != nil {

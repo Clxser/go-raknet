@@ -16,7 +16,10 @@ const (
 	packetSingle
 )
 
-var errMaxAcknowledgement = errors.New("maximum amount of packets in acknowledgement exceeded")
+var (
+	errMaxAcknowledgement       = errors.New("maximum amount of packets in acknowledgement exceeded")
+	errMalformedAcknowledgement = errors.New("malformed acknowledgement: end before start")
+)
 
 // acknowledgement is an acknowledgement packet that may either be an ACK or a
 // NACK, depending on the purpose that it is sent with.
@@ -108,7 +111,11 @@ func (ack *acknowledgement) read(b []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			start, end := loadUint24(b[offset+1:]), loadUint24(b[offset+4:])
-			if uint24(len(ack.packets))+end-start > maxAcknowledgementPackets {
+			if end < start {
+				return errMalformedAcknowledgement
+			}
+			count := int(end) - int(start) + 1
+			if len(ack.packets)+count > maxAcknowledgementPackets {
 				return errMaxAcknowledgement
 			}
 			for pk := start; pk <= end; pk++ {

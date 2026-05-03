@@ -9,11 +9,34 @@ import (
 // uint32, but is an alias for the sake of clarity.
 type uint24 uint32
 
+const (
+	uint24Mask = 1<<24 - 1
+	uint24Half = 1 << 23
+)
+
 // Inc increments a uint24 and returns the old value.
 func (u *uint24) Inc() (old uint24) {
 	ret := *u
-	*u += 1
+	*u = (*u + 1) & uint24Mask
 	return ret
+}
+
+// nextUint24 returns the next uint24 value, wrapping at 24 bits.
+func nextUint24(u uint24) uint24 {
+	return (u + 1) & uint24Mask
+}
+
+// uint24Less reports whether a is before b in the circular uint24 sequence
+// space. It is valid for windows smaller than half of the 24-bit range, which
+// is the case for all RakNet recovery/ordering windows in this package.
+func uint24Less(a, b uint24) bool {
+	return a != b && ((b-a)&uint24Mask) < uint24Half
+}
+
+// uint24Distance returns the forward distance from start to end in the
+// circular uint24 sequence space.
+func uint24Distance(start, end uint24) uint24 {
+	return (end - start) & uint24Mask
 }
 
 // readUint24 reads 3 bytes from the buffer passed and combines it into a

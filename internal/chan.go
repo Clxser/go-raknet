@@ -41,8 +41,11 @@ func (c *ElasticChan[T]) Recv(ctx context.Context) (val T, ok bool) {
 	}
 }
 
-// Send sends a value to the channel. Send never blocks, because if the maximum
-// capacity of the underlying channel is reached, a larger one is created.
+// Send sends a value to the channel. Send does not block while the channel can
+// still grow. On first overflow, the channel grows to its configured maximum
+// so bursty receivers can absorb a full tick without repeated grow/copy work.
+// Once that maximum is reached, Send behaves like a regular channel send and
+// may block until a receiver consumes a value.
 func (c *ElasticChan[T]) Send(val T) {
 	if ccap := int64(cap(c.ch)); c.len.Add(1) >= ccap && ccap < c.lim {
 		// This check happens outside a lock, meaning in the meantime, a call to
@@ -55,8 +58,8 @@ func (c *ElasticChan[T]) Send(val T) {
 	c.ch <- val
 }
 
-// growSend grows the channel to double the capacity, copying all values
-// currently in the channel, and sends the value to the new channel.
+// growSend grows the channel, copying all values currently in the channel, and
+// sends the value to the new channel.
 func (c *ElasticChan[T]) growSend(val T) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

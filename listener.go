@@ -41,6 +41,20 @@ type ListenConfig struct {
 	// BlockDuration defaults to 10s. If set to a negative value, IP addresses
 	// are never blocked on errors.
 	BlockDuration time.Duration
+
+	// MaxReceiveWindow is the maximum receive/reorder window before a
+	// connection is considered abusive or too far behind. Defaults to 2048.
+	// Burst-heavy servers may raise this to absorb single-tick packet floods.
+	MaxReceiveWindow int
+	// MaxPendingPackets is the maximum number of application packets queued for
+	// Conn.Read/ReadPacket before delivery blocks. Defaults to 4096.
+	MaxPendingPackets int
+	// MaxSplitCount is the maximum number of fragments accepted for one split
+	// packet. Defaults to 512.
+	MaxSplitCount int
+	// MaxConcurrentSplits is the maximum number of split packets being
+	// reassembled concurrently. Defaults to 16.
+	MaxConcurrentSplits int
 }
 
 // Listener implements a RakNet connection listener. It follows the same
@@ -182,7 +196,7 @@ func (listener *Listener) ID() int64 {
 func (listener *Listener) listen() {
 	// Create a buffer with the maximum size a UDP packet sent over RakNet is
 	// allowed to have. We can re-use this buffer for each packet.
-	b := make([]byte, 1500)
+	b := make([]byte, recvBufferSize)
 	for {
 		n, addr, err := listener.conn.ReadFrom(b)
 		if err != nil {
@@ -213,7 +227,7 @@ func addrToStr(addr net.Addr) string {
 // handle handles an incoming packet in buffer b from the address passed. If
 // not successful, an error is returned describing the issue.
 func (listener *Listener) handle(b []byte, addr net.Addr) error {
-	value, found := listener.connections.Load(resolve(addr))
+	value, found := listener.connections.Load(addrKey(addr))
 	if !found {
 		return listener.handler.handleUnconnected(b, addr)
 	}
@@ -278,11 +292,15 @@ func (s *security) block(addr net.Addr) {
 	if s.conf.BlockDuration < 0 {
 		return
 	}
+	key, ok := blockKey(addr)
+	if !ok {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.blockCount.Add(1)
-	s.blocks[[16]byte(addr.(*net.UDPAddr).IP.To16())] = time.Now()
+	s.blocks[key] = time.Now()
 }
 
 // blocked checks if the IP of a net.Addr is currently blocked from any packet
@@ -292,11 +310,29 @@ func (s *security) blocked(addr net.Addr) bool {
 		// Fast path optimisation: Prevents (relatively costly) map lookups.
 		return false
 	}
+	key, ok := blockKey(addr)
+	if !ok {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, blocked := s.blocks[[16]byte(addr.(*net.UDPAddr).IP.To16())]
+	_, blocked := s.blocks[key]
 	return blocked
+}
+
+func blockKey(addr net.Addr) ([16]byte, bool) {
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok || udpAddr.IP == nil {
+		return [16]byte{}, false
+	}
+	ip := udpAddr.IP.To16()
+	if ip == nil {
+		return [16]byte{}, false
+	}
+	var key [16]byte
+	copy(key[:], ip)
+	return key, true
 }
 
 // gcBlocks removes blocks from the map that are no longer active. gcBlocks only

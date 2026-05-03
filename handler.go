@@ -16,8 +16,36 @@ import (
 type connectionHandler interface {
 	handle(conn *Conn, b []byte) (handled bool, err error)
 	limitsEnabled() bool
+	maxReceiveWindow() uint24
+	maxPendingPackets() int
+	maxSplitCount() uint32
+	maxConcurrentSplits() int
 	close(conn *Conn)
 	log() *slog.Logger
+}
+
+func receiveWindowLimit(v int) uint24 {
+	if v <= 0 {
+		return defaultMaxReceiveWindow
+	}
+	if v > int(maxConfigurableWindowSize) {
+		return maxConfigurableWindowSize
+	}
+	return uint24(v)
+}
+
+func intLimit(v, defaultValue int) int {
+	if v <= 0 {
+		return defaultValue
+	}
+	return v
+}
+
+func uint32Limit(v, defaultValue int) uint32 {
+	if v <= 0 {
+		v = defaultValue
+	}
+	return uint32(v)
 }
 
 type listenerConnectionHandler struct {
@@ -39,8 +67,24 @@ func (h listenerConnectionHandler) limitsEnabled() bool {
 	return true
 }
 
+func (h listenerConnectionHandler) maxReceiveWindow() uint24 {
+	return receiveWindowLimit(h.l.conf.MaxReceiveWindow)
+}
+
+func (h listenerConnectionHandler) maxPendingPackets() int {
+	return intLimit(h.l.conf.MaxPendingPackets, defaultMaxPendingPackets)
+}
+
+func (h listenerConnectionHandler) maxSplitCount() uint32 {
+	return uint32Limit(h.l.conf.MaxSplitCount, defaultMaxSplitCount)
+}
+
+func (h listenerConnectionHandler) maxConcurrentSplits() int {
+	return intLimit(h.l.conf.MaxConcurrentSplits, defaultMaxConcurrentSplits)
+}
+
 func (h listenerConnectionHandler) close(conn *Conn) {
-	h.l.connections.Delete(resolve(conn.raddr))
+	h.l.connections.Delete(addrKey(conn.raddr))
 }
 
 // cookie calculates a cookie for the net.Addr passed. It is calculated as a
@@ -49,11 +93,17 @@ func (h listenerConnectionHandler) cookie(addr net.Addr, salt uint64) uint32 {
 	if h.l.conf.DisableCookies {
 		return 0
 	}
-	udp, _ := addr.(*net.UDPAddr)
-	b := make([]byte, 10, 26)
+	b := make([]byte, 8, 26)
 	binary.LittleEndian.PutUint64(b, salt)
-	binary.LittleEndian.PutUint16(b[8:], uint16(udp.Port))
-	b = append(b, udp.IP...)
+	if udp, ok := addr.(*net.UDPAddr); ok {
+		b = append(b, 0, 0)
+		binary.LittleEndian.PutUint16(b[8:], uint16(udp.Port))
+		b = append(b, udp.IP...)
+	} else if addr != nil {
+		b = append(b, addr.Network()...)
+		b = append(b, 0)
+		b = append(b, addr.String()...)
+	}
 	// CRC32 isn't cryptographically secure, but we don't really need that here.
 	// A new salt is calculated every time a Listener is created and we don't
 	// have any data that needs to protected. We just need a fast hash.
@@ -130,15 +180,41 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 
 	mtuSize := min(pk.MTU, maxMTUSize)
 
-	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolve(addr), MTU: mtuSize}).MarshalBinary()
-	if _, err := h.l.conn.WriteTo(data, addr); err != nil {
-		return fmt.Errorf("send OPEN_CONNECTION_REPLY_2: %w", err)
+	key := addrKey(addr)
+	value, loaded := h.l.connections.Load(key)
+	var conn *Conn
+	if loaded {
+		conn = value.(*Conn)
+		mtuSize = conn.mtu
+	} else {
+		conn = newConn(h.l.conn, addr, mtuSize, h)
+		actual, ok := h.l.connections.LoadOrStore(key, conn)
+		if ok {
+			conn.cancelFunc()
+			conn = actual.(*Conn)
+			mtuSize = conn.mtu
+			loaded = true
+		}
 	}
 
-	go func() {
-		conn := newConn(h.l.conn, addr, mtuSize, h)
-		h.l.connections.Store(resolve(addr), conn)
+	data, _ := (&message.OpenConnectionReply2{ServerGUID: h.l.id, ClientAddress: resolve(addr), MTU: mtuSize}).MarshalBinary()
+	if _, err := h.l.conn.WriteTo(data, addr); err != nil {
+		if !loaded {
+			conn.cancelFunc()
+			h.l.connections.Delete(key)
+			return fmt.Errorf("send OPEN_CONNECTION_REPLY_2: %w", err)
+		}
+		// A duplicate OPEN_CONNECTION_REQUEST_2 is a best-effort retransmit for
+		// an already-registered peer. Do not surface transient send errors here:
+		// listener.listen blocks an address on returned errors.
+		h.log().Debug("retransmit OPEN_CONNECTION_REPLY_2 failed", "raddr", addrToStr(addr), "err", err.Error())
+		return nil
+	}
 
+	if loaded {
+		return nil
+	}
+	go func() {
 		t := time.NewTimer(time.Second * 10)
 		defer t.Stop()
 		select {
@@ -202,7 +278,13 @@ func (h listenerConnectionHandler) handleNewIncomingConnection(conn *Conn) error
 	return nil
 }
 
-type dialerConnectionHandler struct{ l *slog.Logger }
+type dialerConnectionHandler struct {
+	l                *slog.Logger
+	receiveWindow    int
+	pendingPackets   int
+	splitCount       int
+	concurrentSplits int
+}
 
 var (
 	errUnexpectedCR            = errors.New("unexpected CONNECTION_REQUEST packet")
@@ -219,7 +301,23 @@ func (h dialerConnectionHandler) close(conn *Conn) {
 }
 
 func (h dialerConnectionHandler) limitsEnabled() bool {
-	return false
+	return true
+}
+
+func (h dialerConnectionHandler) maxReceiveWindow() uint24 {
+	return receiveWindowLimit(h.receiveWindow)
+}
+
+func (h dialerConnectionHandler) maxPendingPackets() int {
+	return intLimit(h.pendingPackets, defaultMaxPendingPackets)
+}
+
+func (h dialerConnectionHandler) maxSplitCount() uint32 {
+	return uint32Limit(h.splitCount, defaultMaxSplitCount)
+}
+
+func (h dialerConnectionHandler) maxConcurrentSplits() int {
+	return intLimit(h.concurrentSplits, defaultMaxConcurrentSplits)
 }
 
 func (h dialerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err error) {

@@ -105,6 +105,19 @@ type Dialer struct {
 	// Default is 10. -1 means no limit.
 	// This is only used for the initial connection handshake.
 	MaxTransientErrors int
+
+	// MaxReceiveWindow is the maximum receive/reorder window before the
+	// connection is closed. Defaults to 2048.
+	MaxReceiveWindow int
+	// MaxPendingPackets is the maximum number of application packets queued for
+	// Conn.Read/ReadPacket before delivery blocks. Defaults to 4096.
+	MaxPendingPackets int
+	// MaxSplitCount is the maximum number of fragments accepted for one split
+	// packet. Defaults to 512.
+	MaxSplitCount int
+	// MaxConcurrentSplits is the maximum number of split packets being
+	// reassembled concurrently. Defaults to 16.
+	MaxConcurrentSplits int
 }
 
 // Ping sends a ping to an address and returns the response obtained. If
@@ -145,12 +158,12 @@ func (dialer Dialer) PingContext(ctx context.Context, address string) (response 
 	}
 	defer conn.Close()
 
-	data, _ := (&message.UnconnectedPing{PingTime: timestamp(), ClientGUID: atomic.AddInt64(&dialerID, 1)}).MarshalBinary()
+	data, _ := (&message.UnconnectedPing{PingTime: timestamp(), ClientGUID: nextDialerID()}).MarshalBinary()
 	if _, err := conn.Write(data); err != nil {
 		return nil, dialer.error("ping", err)
 	}
 
-	data = make([]byte, 1492)
+	data = make([]byte, maxMTUSize)
 	n, err := conn.Read(data)
 	if err != nil {
 		return nil, dialer.error("ping", err)
@@ -188,8 +201,14 @@ func (dialer Dialer) dial(ctx context.Context, address string) (net.Conn, error)
 }
 
 // dialerID is a counter used to produce an ID for the client.
-// This should always be negative as per the vanilla client implementation.
-var dialerID = -rand.Int64()
+var dialerID = rand.Uint64()
+
+// nextDialerID returns a negative client GUID as expected by vanilla servers.
+// It never drifts to zero or a positive value, even in long-running processes.
+func nextDialerID() int64 {
+	const mask = 1<<62 - 1
+	return -int64((atomic.AddUint64(&dialerID, 1) & mask) + 1)
+}
 
 // Dial attempts to dial a RakNet connection to the address passed. The address
 // may be either an IP address or a hostname, combined with a port that is
@@ -236,7 +255,7 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 	cs := &connState{
 		conn:               conn,
 		raddr:              conn.RemoteAddr(),
-		id:                 atomic.AddInt64(&dialerID, 1),
+		id:                 nextDialerID(),
 		ticker:             time.NewTicker(time.Second / 2),
 		maxTransientErrors: dialer.MaxTransientErrors,
 	}
@@ -252,7 +271,13 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 // dial finishes the RakNet connection sequence and returns a Conn if
 // successful.
 func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, error) {
-	conn := newConn(internal.ConnToPacketConn(state.conn), state.raddr, state.mtu, dialerConnectionHandler{l: dialer.ErrorLog})
+	conn := newConn(internal.ConnToPacketConn(state.conn), state.raddr, state.mtu, dialerConnectionHandler{
+		l:                dialer.ErrorLog,
+		receiveWindow:    dialer.MaxReceiveWindow,
+		pendingPackets:   dialer.MaxPendingPackets,
+		splitCount:       dialer.MaxSplitCount,
+		concurrentSplits: dialer.MaxConcurrentSplits,
+	})
 	if err := conn.send((&message.ConnectionRequest{ClientGUID: state.id, RequestTime: timestamp()})); err != nil {
 		return nil, dialer.error("dial", fmt.Errorf("send connection request: %w", err))
 	}
@@ -323,7 +348,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 
 	go state.request1(ctx, mtuSizes)
 
-	b := make([]byte, 1492)
+	b := make([]byte, maxMTUSize)
 	for {
 		// Start reading in a loop so that we can find an open connection reply
 		// 1 packet.
@@ -359,8 +384,10 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 		case message.IDIncompatibleProtocolVersion:
 			response := &message.IncompatibleProtocolVersion{}
 			if err := response.UnmarshalBinary(b[1:n]); err != nil {
+				state.close()
 				return fmt.Errorf("read incompatible protocol version: %w", err)
 			}
+			state.close()
 			return fmt.Errorf("mismatched protocol: client protocol = %v, server protocol = %v", protocolVersion, response.ServerProtocol)
 		}
 	}
@@ -391,7 +418,7 @@ func (state *connState) openConnection(ctx context.Context) error {
 
 	go state.request2(ctx, state.mtu)
 
-	b := make([]byte, 1492)
+	b := make([]byte, maxMTUSize)
 	for {
 		// Start reading in a loop so that we can find open connection reply 2
 		// packets.

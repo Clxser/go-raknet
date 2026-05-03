@@ -24,12 +24,14 @@ func TestCongestionWindowTransmissionBandwidth(t *testing.T) {
 
 func TestCongestionWindowAckNakAndResend(t *testing.T) {
 	win := newCongestionWindow(1000)
-	win.onAck(100*time.Millisecond, 0, 1)
+	win.onAck(100*time.Millisecond, 0, 1, true)
 	if win.cwnd != 2000 {
 		t.Fatalf("cwnd after first ACK = %v, want 2000", win.cwnd)
 	}
-	if got, want := win.rto(), 630*time.Millisecond; got != want {
-		t.Fatalf("rto after first ACK = %v, want %v", got, want)
+	const additionalVariance = 30 * time.Millisecond
+	wantRTO := 2*100*time.Millisecond + 4*100*time.Millisecond + additionalVariance
+	if got := win.rto(); got != wantRTO {
+		t.Fatalf("rto after first ACK = %v, want %v", got, wantRTO)
 	}
 
 	win.onNAK()
@@ -37,7 +39,7 @@ func TestCongestionWindowAckNakAndResend(t *testing.T) {
 		t.Fatalf("ssThresh after NACK = %v, want %v", got, want)
 	}
 
-	win.onAck(100*time.Millisecond, 1, 2)
+	win.onAck(100*time.Millisecond, 1, 2, true)
 	if win.cwnd <= 2000 {
 		t.Fatalf("cwnd after second ACK = %v, want growth", win.cwnd)
 	}
@@ -67,6 +69,9 @@ func TestConnQueuesReliableDatagramsUntilAck(t *testing.T) {
 	if got := len(conn.sendQueue); got != 1 {
 		t.Fatalf("queued datagrams before ACK = %v, want 1", got)
 	}
+	if got := conn.Pending(); got != 2 {
+		t.Fatalf("pending before ACK = %v, want 2", got)
+	}
 
 	ackBuf := bytes.NewBuffer(nil)
 	(&acknowledgement{packets: []uint24{0}}).write(ackBuf, conn.effectiveMTU())
@@ -78,6 +83,62 @@ func TestConnQueuesReliableDatagramsUntilAck(t *testing.T) {
 	}
 	if got := len(conn.sendQueue); got != 0 {
 		t.Fatalf("queued datagrams after ACK = %v, want 0", got)
+	}
+	if got := conn.Pending(); got != 1 {
+		t.Fatalf("pending after ACK = %v, want 1", got)
+	}
+}
+
+func TestConnAckRetransmittedDatagramSkipsRTTUpdate(t *testing.T) {
+	conn := newTestConn(428)
+	conn.seq = 1
+	conn.congestion.estimatedRTT = 100 * time.Millisecond
+	conn.congestion.deviationRTT = 100 * time.Millisecond
+	conn.congestion.lastRTT = 100 * time.Millisecond
+	beforeCWND := conn.congestion.cwnd
+
+	pk := testReliablePacket(100)
+	conn.retransmission.unacknowledged[0] = resendRecord{
+		pk:            pk,
+		timestamp:     time.Now().Add(-10 * time.Millisecond),
+		length:        pk.datagramSize(),
+		retransmitted: true,
+	}
+	conn.retransmission.inFlightBytes = pk.datagramSize()
+
+	ackBuf := bytes.NewBuffer(nil)
+	(&acknowledgement{packets: []uint24{0}}).write(ackBuf, conn.effectiveMTU())
+	if err := conn.handleACK(ackBuf.Bytes()); err != nil {
+		t.Fatalf("handle ACK: %v", err)
+	}
+	if got, want := conn.congestion.estimatedRTT, 100*time.Millisecond; got != want {
+		t.Fatalf("estimatedRTT = %v, want %v", got, want)
+	}
+	if conn.congestion.cwnd <= beforeCWND {
+		t.Fatalf("cwnd = %v, want growth above %v", conn.congestion.cwnd, beforeCWND)
+	}
+}
+
+func TestPacketSizeMatchesWriteLength(t *testing.T) {
+	for _, rel := range []reliability{
+		reliabilityUnreliable,
+		reliabilityUnreliableSequenced,
+		reliabilityReliable,
+		reliabilityReliableOrdered,
+		reliabilityReliableSequenced,
+	} {
+		pk := &packet{
+			reliability:   rel,
+			messageIndex:  1,
+			sequenceIndex: 2,
+			orderIndex:    3,
+			content:       []byte{1, 2, 3},
+		}
+		buf := bytes.NewBuffer(nil)
+		pk.write(buf)
+		if got, want := pk.size(), buf.Len(); got != want {
+			t.Fatalf("size for reliability %v = %v, write length = %v", rel, got, want)
+		}
 	}
 }
 
@@ -152,6 +213,22 @@ func (testConnectionHandler) handle(*Conn, []byte) (bool, error) {
 
 func (testConnectionHandler) limitsEnabled() bool {
 	return false
+}
+
+func (testConnectionHandler) maxReceiveWindow() uint24 {
+	return defaultMaxReceiveWindow
+}
+
+func (testConnectionHandler) maxPendingPackets() int {
+	return defaultMaxPendingPackets
+}
+
+func (testConnectionHandler) maxSplitCount() uint32 {
+	return defaultMaxSplitCount
+}
+
+func (testConnectionHandler) maxConcurrentSplits() int {
+	return defaultMaxConcurrentSplits
 }
 
 func (testConnectionHandler) close(*Conn) {}

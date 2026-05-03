@@ -20,14 +20,16 @@ func (win *datagramWindow) add(index uint24) bool {
 	if win.seen(index) {
 		return false
 	}
-	win.highest = max(win.highest, index+1)
+	if !uint24Less(index, win.highest) {
+		win.highest = nextUint24(index)
+	}
 	win.queue[index] = time.Now()
 	return true
 }
 
 // seen checks if the index passed is known to the datagramWindow.
 func (win *datagramWindow) seen(index uint24) bool {
-	if index < win.lowest {
+	if uint24Less(index, win.lowest) {
 		return true
 	}
 	_, ok := win.queue[index]
@@ -37,13 +39,14 @@ func (win *datagramWindow) seen(index uint24) bool {
 // shift attempts to delete as many indices from the queue as possible,
 // increasing the lowest index if and when possible.
 func (win *datagramWindow) shift() (n int) {
-	var index uint24
-	for index = win.lowest; index < win.highest; index++ {
+	index := win.lowest
+	for index != win.highest {
 		if _, ok := win.queue[index]; !ok {
 			break
 		}
 		delete(win.queue, index)
 		n++
+		index = nextUint24(index)
 	}
 	win.lowest = index
 	return n
@@ -54,9 +57,9 @@ func (win *datagramWindow) shift() (n int) {
 // is shifted after this call.
 func (win *datagramWindow) missing(since time.Duration) (indices []uint24) {
 	missing := false
-	for index := int(win.highest) - 1; index >= int(win.lowest); index-- {
-		i := uint24(index)
-		t, ok := win.queue[i]
+	for index := win.highest; index != win.lowest; {
+		index = (index - 1) & uint24Mask
+		t, ok := win.queue[index]
 		if ok {
 			if time.Since(t) >= since {
 				// All packets before this one took too long to arrive, so we
@@ -66,8 +69,8 @@ func (win *datagramWindow) missing(since time.Duration) (indices []uint24) {
 			continue
 		}
 		if missing {
-			indices = append(indices, i)
-			win.queue[i] = time.Time{}
+			indices = append(indices, index)
+			win.queue[index] = time.Time{}
 		}
 	}
 	win.shift()
@@ -76,5 +79,5 @@ func (win *datagramWindow) missing(since time.Duration) (indices []uint24) {
 
 // size returns the size of the datagramWindow.
 func (win *datagramWindow) size() uint24 {
-	return win.highest - win.lowest
+	return uint24Distance(win.lowest, win.highest)
 }
